@@ -16,6 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import ImageTk
 import threading
 import glob
+from sklearn.model_selection import train_test_split
 
 # Enable mixed precision training for faster performance
 policy = Policy('mixed_float16')
@@ -83,36 +84,73 @@ def build_mask_removal_model(input_shape=(256, 256, 3)):
     return model
 
 class DataGenerator:
-    """Optimized class to prepare and load training data"""
+    """Optimized class to prepare and load training data from single images containing both masked and unmasked faces"""
     
-    def __init__(self, data_dir, batch_size=8, img_size=(256, 256), validation_split=0.2):
+    def __init__(self, data_dir="masked_unmasked", batch_size=8, img_size=(256, 256), validation_split=0.2):
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.img_size = img_size
         self.validation_split = validation_split
-        self.masked_dir = os.path.join(data_dir, 'masked')
-        self.unmasked_dir = os.path.join(data_dir, 'unmasked')
         
     def validate_data(self):
-        """Verify that the data directory structure is correct"""
-        if not os.path.exists(self.masked_dir):
-            raise ValueError(f"Masked images directory not found: {self.masked_dir}")
-        if not os.path.exists(self.unmasked_dir):
-            raise ValueError(f"Unmasked images directory not found: {self.unmasked_dir}")
-            
-        masked_files = glob.glob(os.path.join(self.masked_dir, '**', '*.[jJpP][pPnN][gG]'), recursive=True)
-        unmasked_files = glob.glob(os.path.join(self.unmasked_dir, '**', '*.[jJpP][pPnN][gG]'), recursive=True)
+        """Verify that the data directory contains valid images"""
+        image_files = glob.glob(os.path.join(self.data_dir, '*.[jJpP][pPnN][gG]'))  # Look directly in masked_unmasked
         
-        if len(masked_files) == 0:
-            raise ValueError(f"No image files found in masked directory: {self.masked_dir}")
-        if len(unmasked_files) == 0:
-            raise ValueError(f"No image files found in unmasked directory: {self.unmasked_dir}")
+        if len(image_files) == 0:
+            raise ValueError(f"No image files found in directory: {self.data_dir}")
             
-        print(f"Found {len(masked_files)} masked images and {len(unmasked_files)} unmasked images")
+        print(f"Found {len(image_files)} images")
         return True
         
+    def detect_and_extract_faces(self, image_path):
+        """Detect and extract both masked and unmasked faces from a single image"""
+        try:
+            # Load image
+            img = cv2.imread(image_path)
+            if img is None:
+                print(f"Could not read image: {image_path}")
+                return None, None
+            
+            # Convert to grayscale for face detection
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            # Detect faces
+            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(100, 100))
+            
+            if len(faces) < 2:
+                print(f"Could not find at least 2 faces in image: {image_path}")
+                return None, None
+                
+            # Sort faces by x-coordinate (assuming left is masked, right is unmasked)
+            faces = sorted(faces, key=lambda x: x[0])
+            
+            # Extract first face (assumed to be masked)
+            x1, y1, w1, h1 = faces[0]
+            masked_face = img[y1:y1+h1, x1:x1+w1]
+            
+            # Extract second face (assumed to be unmasked)
+            x2, y2, w2, h2 = faces[1]
+            unmasked_face = img[y2:y2+h2, x2:x2+w2]
+            
+            # Resize both faces to target size
+            masked_face = cv2.resize(masked_face, self.img_size)
+            unmasked_face = cv2.resize(unmasked_face, self.img_size)
+            
+            return masked_face, unmasked_face
+            
+        except Exception as e:
+            print(f"Error processing image {image_path}: {e}")
+            return None, None
+    
     def create_generators(self):
         """Create optimized data generators for training with validation split"""
+        # Get all image files
+        image_files = glob.glob(os.path.join(self.data_dir, '*.[jJpP][pPnN][gG]'))  # Look directly in masked_unmasked
+        
+        # Split into train and validation sets
+        train_files, val_files = train_test_split(image_files, test_size=self.validation_split, random_state=42)
+        
         # Data augmentation config
         data_gen_args = dict(
             rescale=1./255,
@@ -124,59 +162,55 @@ class DataGenerator:
             fill_mode='nearest'
         )
         
-        # Create image generators with validation split
-        seed = 42
-        masked_gen = ImageDataGenerator(**data_gen_args, validation_split=self.validation_split)
-        unmasked_gen = ImageDataGenerator(**data_gen_args, validation_split=self.validation_split)
+        # Custom generator that yields pairs of masked/unmasked faces
+        def pair_generator(image_files, batch_size, augment=False):
+            while True:
+                # Shuffle files at start of each epoch
+                np.random.shuffle(image_files)
+                
+                for i in range(0, len(image_files), batch_size):
+                    batch_files = image_files[i:i+batch_size]
+                    masked_batch = []
+                    unmasked_batch = []
+                    
+                    for file_path in batch_files:
+                        masked, unmasked = self.detect_and_extract_faces(file_path)
+                        if masked is not None and unmasked is not None:
+                            masked_batch.append(masked)
+                            unmasked_batch.append(unmasked)
+                    
+                    if len(masked_batch) == 0:
+                        continue
+                        
+                    masked_batch = np.array(masked_batch, dtype=np.float32) / 255.0
+                    unmasked_batch = np.array(unmasked_batch, dtype=np.float32) / 255.0
+                    
+                    if augment:
+                        # Apply the same augmentation to both masked and unmasked faces
+                        seed = np.random.randint(99999)
+                        
+                        # Create temporary generator for augmentation
+                        temp_gen = ImageDataGenerator(**data_gen_args)
+                        
+                        # Apply same transformation to both
+                        masked_aug = temp_gen.flow(masked_batch, batch_size=len(masked_batch), 
+                                                  shuffle=False, seed=seed)
+                        unmasked_aug = temp_gen.flow(unmasked_batch, batch_size=len(unmasked_batch), 
+                                                    shuffle=False, seed=seed)
+                        
+                        yield next(masked_aug), next(unmasked_aug)
+                    else:
+                        yield masked_batch, unmasked_batch
         
-        # Create training generators
-        masked_train = masked_gen.flow_from_directory(
-            self.masked_dir,
-            target_size=self.img_size,
-            batch_size=self.batch_size,
-            class_mode=None,
-            seed=seed,
-            subset='training'
-        )
-        
-        unmasked_train = unmasked_gen.flow_from_directory(
-            self.unmasked_dir,
-            target_size=self.img_size,
-            batch_size=self.batch_size,
-            class_mode=None,
-            seed=seed,
-            subset='training'
-        )
-        
-        # Create validation generators
-        masked_val = masked_gen.flow_from_directory(
-            self.masked_dir,
-            target_size=self.img_size,
-            batch_size=self.batch_size,
-            class_mode=None,
-            seed=seed,
-            subset='validation'
-        )
-        
-        unmasked_val = unmasked_gen.flow_from_directory(
-            self.unmasked_dir,
-            target_size=self.img_size,
-            batch_size=self.batch_size,
-            class_mode=None,
-            seed=seed,
-            subset='validation'
-        )
-        
-        # Combine generators
-        train_generator = zip(masked_train, unmasked_train)
-        val_generator = zip(masked_val, unmasked_val)
+        # Create generators
+        train_gen = pair_generator(train_files, self.batch_size, augment=True)
+        val_gen = pair_generator(val_files, self.batch_size, augment=False)
         
         # Calculate steps
-        masked_count = len(glob.glob(os.path.join(self.masked_dir, '**', '*.[jJpP][pPnN][gG]'), recursive=True))
-        train_steps = int(masked_count * (1 - self.validation_split)) // self.batch_size
-        val_steps = int(masked_count * self.validation_split) // self.batch_size
+        train_steps = max(1, len(train_files) // self.batch_size)
+        val_steps = max(1, len(val_files) // self.batch_size)
         
-        return train_generator, val_generator, train_steps, val_steps
+        return train_gen, val_gen, train_steps, val_steps
 
 class MaskRemover:
     def __init__(self, model_path=None):
@@ -222,7 +256,7 @@ class MaskRemover:
         
         result_img = img.copy()
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4)
+        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(100, 100))
         
         if len(faces) == 0:
             print("No faces detected in the image.")
@@ -250,7 +284,7 @@ class MaskRemover:
         
         return result_img, unmasked_faces
         
-    def train(self, data_dir, epochs=50, batch_size=8, callbacks=None):
+    def train(self, data_dir="masked_unmasked", epochs=50, batch_size=8, callbacks=None):
         """Train the mask removal model with validation."""
         data_generator = DataGenerator(data_dir, batch_size=batch_size)
         data_generator.validate_data()
@@ -481,7 +515,7 @@ class MaskRemovalApp:
         
         tk.Label(dir_frame, text="Dataset Directory:").pack(side=tk.LEFT)
         
-        self.dataset_path = tk.StringVar()
+        self.dataset_path = tk.StringVar(value="masked_unmasked")
         dataset_entry = tk.Entry(dir_frame, textvariable=self.dataset_path, width=25)
         dataset_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
@@ -503,7 +537,7 @@ class MaskRemovalApp:
         tk.Spinbox(params_frame, from_=1, to=32, textvariable=self.batch_size_var, width=5).grid(row=0, column=3, sticky='w', padx=5, pady=5)
         
         # Note about data organization
-        note_text = "Note: Dataset must contain 'masked' and 'unmasked' subdirectories\nwith corresponding paired images."
+        note_text = "Note: Dataset should contain images with both masked\nand unmasked faces of the same person."
         tk.Label(train_dialog, text=note_text, fg="blue").pack(pady=10)
         
         # Buttons
@@ -536,13 +570,13 @@ class MaskRemovalApp:
         
         # Validate dataset structure
         try:
-            masked_dir = os.path.join(data_dir, 'masked')
-            unmasked_dir = os.path.join(data_dir, 'unmasked')
-            
-            if not os.path.exists(masked_dir) or not os.path.exists(unmasked_dir):
-                messagebox.showerror("Error", 
-                    "Invalid dataset structure.\nRequired structure:\n"
-                    f"{data_dir}/\n├── masked/\n└── unmasked/")
+            if not os.path.exists(data_dir):
+                messagebox.showerror("Error", f"Directory does not exist: {data_dir}")
+                return
+                
+            image_files = glob.glob(os.path.join(data_dir, '*.[jJpP][pPnN][gG]'))
+            if len(image_files) == 0:
+                messagebox.showerror("Error", f"No images found in directory: {data_dir}")
                 return
         except Exception as e:
             messagebox.showerror("Error", f"Error validating dataset: {e}")
